@@ -1,0 +1,7 @@
+pyqt6-tools
+pyotp==2.9.0
+webauthn==1.11.1
+cryptography
+cbor2
+qrcode
+pillow
