@@ -5,3 +5,4 @@ cryptography
 cbor2
 qrcode
 pillow
+fido2
