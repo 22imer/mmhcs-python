@@ -2,6 +2,8 @@
 login_ui.py — Luxury Login Interface wired to passkey backend.
 Supports registration, authentication, forced TOTP setup on first login,
 and launches Chatify in the browser on success.
+
+Uses the Chatify backend REST API for user signup/login.
 """
 
 import sys
@@ -13,12 +15,10 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import jwt as pyjwt
 import pyotp
 import qrcode
+import requests
 from dotenv import load_dotenv
-from pymongo import MongoClient
-import bcrypt
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QImage
@@ -40,60 +40,59 @@ from passkey_client import get_client, is_windows_client_available
 import credential_store
 
 # ═══════════════════════════════════════════════════════════════════════
-# Load Chatify env for JWT minting + MongoDB provisioning
+# Load Chatify env
 # ═══════════════════════════════════════════════════════════════════════
 
 load_dotenv(Path(__file__).parent / ".env")
 
-_JWT_SECRET = os.getenv("JWT_SECRET", "")
-_MONGO_URI = os.getenv("MONGO_URI", "")
 _CHATIFY_BACKEND_URL = os.getenv("CHATIFY_BACKEND_URL", "http://localhost:3000")
 _CHATIFY_CLIENT_URL = os.getenv("CHATIFY_CLIENT_URL", "http://localhost:5173")
 
 
-def _get_or_create_chatify_user(username: str) -> str:
+# ═══════════════════════════════════════════════════════════════════════
+# Chatify Backend API helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _api_login(email: str, password: str) -> dict:
     """
-    Find (or create) the user in Chatify's MongoDB and return their _id as a string.
-    On creation, uses username@gmail.com as placeholder email.
+    Login via POST /api/auth/login.
+    Returns {"user": {...}, "token": "..."} on success.
+    Raises ValueError on failure.
     """
-    client = MongoClient(_MONGO_URI)
-    db = client["chatap"]
-    users = db["users"]
+    resp = requests.post(
+        f"{_CHATIFY_BACKEND_URL}/api/auth/login",
+        json={"email": email, "password": password},
+        timeout=10,
+    )
+    body = resp.json()
 
-    email = f"{username}@gmail.com"
-    user = users.find_one({"email": email})
+    if resp.status_code != 200:
+        raise ValueError(body.get("error", "Login failed"))
 
-    if user:
-        user_id = str(user["_id"])
-        client.close()
-        return user_id
-
-    # Provision a new user with a random password hash
-    random_pw = os.urandom(32).hex()
-    hashed = bcrypt.hashpw(random_pw.encode("utf-8"), bcrypt.gensalt(rounds=10))
-
-    doc = {
-        "email": email,
-        "fullName": username,
-        "password": hashed,
-        "profilePic": "",
-        "createdAt": datetime.now(timezone.utc),
-        "updatedAt": datetime.now(timezone.utc),
-    }
-    result = users.insert_one(doc)
-    user_id = str(result.inserted_id)
-    client.close()
-    return user_id
+    # Extract JWT from the Set-Cookie header
+    token = resp.cookies.get("jwt", "")
+    return {"user": body, "token": token}
 
 
-def _mint_chatify_jwt(user_id: str) -> str:
-    """Mint a JWT identical to Chatify backend's generate_token()."""
-    payload = {
-        "userId": user_id,
-        "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc) + timedelta(days=7),
-    }
-    return pyjwt.encode(payload, _JWT_SECRET, algorithm="HS256")
+def _api_signup(email: str, fullName: str, password: str) -> dict:
+    """
+    Signup via POST /api/auth/signup.
+    Returns {"user": {...}, "token": "..."} on success.
+    Raises ValueError on failure.
+    """
+    resp = requests.post(
+        f"{_CHATIFY_BACKEND_URL}/api/auth/signup",
+        json={"email": email, "fullName": fullName, "password": password},
+        timeout=10,
+    )
+    body = resp.json()
+
+    if resp.status_code not in (200, 201):
+        raise ValueError(body.get("error", "Signup failed"))
+
+    token = resp.cookies.get("jwt", "")
+    return {"user": body, "token": token}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -191,7 +190,7 @@ QLabel#accentLine {
     min-height: 1px;
 }
 
-QLineEdit#usernameInput, QLineEdit#totpInput {
+QLineEdit#usernameInput, QLineEdit#emailInput, QLineEdit#passwordInput, QLineEdit#totpInput {
     background-color: #000000;
     border: 1px solid #ffffff;
     border-radius: 10px;
@@ -201,7 +200,7 @@ QLineEdit#usernameInput, QLineEdit#totpInput {
     font-weight: 400;
     selection-background-color: #333333;
 }
-QLineEdit#usernameInput:focus, QLineEdit#totpInput:focus {
+QLineEdit#usernameInput:focus, QLineEdit#emailInput:focus, QLineEdit#passwordInput:focus, QLineEdit#totpInput:focus {
     border: 1px solid #ffffff;
     background-color: #0a0a0a;
 }
@@ -361,10 +360,10 @@ class LoginPage(QWidget):
         # ── Card ────────────────────────────────────────────────────
         card = QFrame()
         card.setObjectName("cardFrame")
-        card.setFixedSize(400, 520)
+        card.setFixedSize(400, 640)
 
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(40, 44, 40, 36)
+        lay.setContentsMargins(40, 36, 40, 30)
         lay.setSpacing(0)
 
         # Diamond icon
@@ -372,7 +371,7 @@ class LoginPage(QWidget):
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_label.setStyleSheet("color: #ffffff; font-size: 20px;")
         lay.addWidget(icon_label)
-        lay.addSpacing(12)
+        lay.addSpacing(10)
 
         # Title
         title = QLabel("Welcome")
@@ -381,11 +380,11 @@ class LoginPage(QWidget):
         lay.addWidget(title)
         lay.addSpacing(4)
 
-        subtitle = QLabel("Authenticate with your passkey")
+        subtitle = QLabel("Sign in with your Chatify account")
         subtitle.setObjectName("subtitleLabel")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(subtitle)
-        lay.addSpacing(12)
+        lay.addSpacing(10)
 
         # Accent line
         accent = QLabel()
@@ -395,20 +394,47 @@ class LoginPage(QWidget):
         accent_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
         accent_container.addWidget(accent)
         lay.addLayout(accent_container)
-        lay.addSpacing(28)
+        lay.addSpacing(20)
 
-        # Username field
-        field_label = QLabel("USERNAME")
-        field_label.setObjectName("fieldLabel")
-        lay.addWidget(field_label)
-        lay.addSpacing(8)
+        # Email field
+        email_label = QLabel("EMAIL")
+        email_label.setObjectName("fieldLabel")
+        lay.addWidget(email_label)
+        lay.addSpacing(6)
+
+        self.email_input = QLineEdit()
+        self.email_input.setObjectName("emailInput")
+        self.email_input.setPlaceholderText("you@example.com")
+        self.email_input.setMinimumHeight(44)
+        lay.addWidget(self.email_input)
+        lay.addSpacing(14)
+
+        # Password field
+        password_label = QLabel("PASSWORD")
+        password_label.setObjectName("fieldLabel")
+        lay.addWidget(password_label)
+        lay.addSpacing(6)
+
+        self.password_input = QLineEdit()
+        self.password_input.setObjectName("passwordInput")
+        self.password_input.setPlaceholderText("Enter your password")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setMinimumHeight(44)
+        lay.addWidget(self.password_input)
+        lay.addSpacing(14)
+
+        # Full Name field (only used for registration)
+        fullname_label = QLabel("FULL NAME  (for signup only)")
+        fullname_label.setObjectName("fieldLabel")
+        lay.addWidget(fullname_label)
+        lay.addSpacing(6)
 
         self.username_input = QLineEdit()
         self.username_input.setObjectName("usernameInput")
-        self.username_input.setPlaceholderText("Enter your username")
-        self.username_input.setMinimumHeight(48)
+        self.username_input.setPlaceholderText("Enter your full name")
+        self.username_input.setMinimumHeight(44)
         lay.addWidget(self.username_input)
-        lay.addSpacing(24)
+        lay.addSpacing(18)
 
         # Login button
         self.login_btn = QPushButton("LOGIN")
@@ -417,7 +443,7 @@ class LoginPage(QWidget):
         self.login_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.login_btn.clicked.connect(self._on_login)
         lay.addWidget(self.login_btn)
-        lay.addSpacing(12)
+        lay.addSpacing(10)
 
         # Register button
         self.register_btn = QPushButton("REGISTER")
@@ -426,7 +452,7 @@ class LoginPage(QWidget):
         self.register_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.register_btn.clicked.connect(self._on_register)
         lay.addWidget(self.register_btn)
-        lay.addSpacing(16)
+        lay.addSpacing(12)
 
         # Status label
         self.status_label = QLabel("")
@@ -441,11 +467,26 @@ class LoginPage(QWidget):
 
     # ── Helpers ────────────────────────────────────────────────────
 
+    def _get_email_password(self) -> tuple[str, str] | None:
+        email = self.email_input.text().strip()
+        password = self.password_input.text()
+        if not email:
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText("Please enter your email")
+            self.email_input.setFocus()
+            return None
+        if not password:
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText("Please enter your password")
+            self.password_input.setFocus()
+            return None
+        return email, password
+
     def _get_username(self) -> str | None:
         username = self.username_input.text().strip()
         if not username:
             self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-            self.status_label.setText("Please enter a username")
+            self.status_label.setText("Please enter your full name")
             self.username_input.setFocus()
             return None
         return username
@@ -453,6 +494,8 @@ class LoginPage(QWidget):
     def _set_busy(self, busy: bool, message: str = ""):
         self.login_btn.setEnabled(not busy)
         self.register_btn.setEnabled(not busy)
+        self.email_input.setEnabled(not busy)
+        self.password_input.setEnabled(not busy)
         self.username_input.setEnabled(not busy)
         if message:
             self.status_label.setStyleSheet("color: #ffffff; font-size: 11px;")
@@ -461,18 +504,42 @@ class LoginPage(QWidget):
     # ── Login Flow ────────────────────────────────────────────────
 
     def _on_login(self):
-        username = self._get_username()
-        if not username:
-            return
-
-        # Check if user has credentials
-        creds = credential_store.get_credentials(username)
+        creds = self._get_email_password()
         if not creds:
+            return
+        email, password = creds
+
+        self._set_busy(True, "⏳  Logging in via Chatify API…")
+
+        try:
+            result = _api_login(email, password)
+        except ValueError as e:
+            self._set_busy(False)
             self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-            self.status_label.setText(f"No passkey registered for '{username}'. Register first.")
+            self.status_label.setText(f"❌  {e}")
+            return
+        except Exception as e:
+            self._set_busy(False)
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText(f"❌  Cannot reach the server: {e}")
             return
 
-        self._set_busy(True, "⏳  Waiting for authenticator…")
+        # Store API response for later use
+        user = result["user"]
+        username = user.get("fullName", email.split("@")[0])
+        self._api_token = result["token"]
+        self._api_user = user
+
+        # Check if user has passkey credentials registered
+        creds_list = credential_store.get_credentials(username)
+        if not creds_list:
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText(f"No passkey registered for '{username}'. Click REGISTER first.")
+            self._set_busy(False)
+            return
+
+        self.status_label.setStyleSheet("color: #ffffff; font-size: 11px;")
+        self.status_label.setText("⏳  Waiting for authenticator…")
         self._worker = AuthenticateWorker(self.server, username)
         self._worker.finished.connect(self._on_login_done)
         self._worker.error.connect(self._on_login_error)
@@ -481,6 +548,9 @@ class LoginPage(QWidget):
     def _on_login_done(self, summary: dict):
         self._set_busy(False)
         username = summary.get("username", "")
+        # Attach the API token + user to the summary
+        summary["_api_token"] = getattr(self, "_api_token", "")
+        summary["_api_user"] = getattr(self, "_api_user", {})
         self.status_label.setStyleSheet("color: #64dba0; font-size: 11px;")
         self.status_label.setText(f"✅  Authenticated as '{username}'")
         self.login_success.emit(username, summary)
@@ -488,16 +558,49 @@ class LoginPage(QWidget):
     def _on_login_error(self, msg: str):
         self._set_busy(False)
         self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-        self.status_label.setText(f"❌  Login failed: {msg.split(chr(10))[0]}")
+        self.status_label.setText(f"❌  Passkey failed: {msg.split(chr(10))[0]}")
 
     # ── Register Flow ─────────────────────────────────────────────
 
     def _on_register(self):
+        creds = self._get_email_password()
+        if not creds:
+            return
+        email, password = creds
         username = self._get_username()
         if not username:
             return
 
-        self._set_busy(True, "⏳  Waiting for authenticator…")
+        self._set_busy(True, "⏳  Creating account via Chatify API…")
+
+        # First signup/login via the API
+        try:
+            # Try to signup first
+            try:
+                result = _api_signup(email, username, password)
+            except ValueError as e:
+                # If email already exists, try login instead
+                if "already exists" in str(e).lower():
+                    result = _api_login(email, password)
+                else:
+                    raise
+        except ValueError as e:
+            self._set_busy(False)
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText(f"❌  {e}")
+            return
+        except Exception as e:
+            self._set_busy(False)
+            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
+            self.status_label.setText(f"❌  Cannot reach the server: {e}")
+            return
+
+        self._api_token = result["token"]
+        self._api_user = result["user"]
+
+        # Now register passkey
+        self.status_label.setStyleSheet("color: #ffffff; font-size: 11px;")
+        self.status_label.setText("⏳  Waiting for authenticator…")
         self._worker = RegisterWorker(self.server, username)
         self._worker.finished.connect(self._on_register_done)
         self._worker.error.connect(self._on_register_error)
@@ -960,24 +1063,23 @@ class LuxuryLoginWindow(QWidget):
     def _launch_chatify(self, username: str, summary: dict):
         """
         Called after full authentication (passkey + TOTP).
-        Mints a JWT, opens the browser to Chatify's fido-callback, and closes.
+        Uses the JWT from the API login to open Chatify in the browser.
         """
         self.setWindowTitle("Launching Chatify…")
 
         # Show launching status on the welcome page
         self.welcome_page.set_user(username, summary)
         self.welcome_page.welcome_title.setText("Launching Chatify…")
-        self.welcome_page.detail_label.setText("Minting token and opening browser…")
+        self.welcome_page.detail_label.setText("Opening browser…")
         self.stack.setCurrentIndex(3)
 
         try:
-            # 1. Find or create user in Chatify's MongoDB
-            user_id = _get_or_create_chatify_user(username)
+            # Use the JWT token obtained from the API login
+            token = summary.get("_api_token", "")
+            if not token:
+                raise ValueError("No API token available — login may have failed")
 
-            # 2. Mint JWT
-            token = _mint_chatify_jwt(user_id)
-
-            # 3. Open browser to the fido-callback endpoint
+            # Open browser to the fido-callback endpoint which sets the cookie
             callback_url = f"{_CHATIFY_BACKEND_URL}/api/auth/fido-callback?token={token}"
             webbrowser.open(callback_url)
 
@@ -994,6 +1096,8 @@ class LuxuryLoginWindow(QWidget):
             self.welcome_page.detail_label.setText(f"Error: {exc}")
 
     def _show_login(self):
+        self.login_page.email_input.clear()
+        self.login_page.password_input.clear()
         self.login_page.username_input.clear()
         self.login_page.status_label.setText("")
         self.stack.setCurrentIndex(0)
