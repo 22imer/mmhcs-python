@@ -459,6 +459,7 @@ class LoginPage(QWidget):
 class TotpSetupPage(QWidget):
     """Shows a QR code and requires a 6-digit confirmation to save TOTP."""
 
+
     totp_confirmed = pyqtSignal(str, dict)  # username, login_summary
 
     def __init__(self):
