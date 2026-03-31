@@ -1,18 +1,26 @@
 """
 login_ui.py — Luxury Login Interface wired to passkey backend.
 Supports registration, authentication, forced TOTP setup on first login,
-and a welcome view on success.
+and launches Chatify in the browser on success.
 """
 
 import sys
 import io
 import json
+import os
+import webbrowser
 import traceback
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import jwt as pyjwt
 import pyotp
 import qrcode
+from dotenv import load_dotenv
+from pymongo import MongoClient
+import bcrypt
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QApplication,
@@ -30,6 +38,62 @@ from PyQt6.QtWidgets import (
 from passkey_server import PasskeyServer
 from passkey_client import get_client, is_windows_client_available
 import credential_store
+
+# ═══════════════════════════════════════════════════════════════════════
+# Load Chatify env for JWT minting + MongoDB provisioning
+# ═══════════════════════════════════════════════════════════════════════
+
+load_dotenv(Path(__file__).parent / ".env")
+
+_JWT_SECRET = os.getenv("JWT_SECRET", "")
+_MONGO_URI = os.getenv("MONGO_URI", "")
+_CHATIFY_BACKEND_URL = os.getenv("CHATIFY_BACKEND_URL", "http://localhost:3000")
+_CHATIFY_CLIENT_URL = os.getenv("CHATIFY_CLIENT_URL", "http://localhost:5173")
+
+
+def _get_or_create_chatify_user(username: str) -> str:
+    """
+    Find (or create) the user in Chatify's MongoDB and return their _id as a string.
+    On creation, uses username@gmail.com as placeholder email.
+    """
+    client = MongoClient(_MONGO_URI)
+    db = client["chatap"]
+    users = db["users"]
+
+    email = f"{username}@gmail.com"
+    user = users.find_one({"email": email})
+
+    if user:
+        user_id = str(user["_id"])
+        client.close()
+        return user_id
+
+    # Provision a new user with a random password hash
+    random_pw = os.urandom(32).hex()
+    hashed = bcrypt.hashpw(random_pw.encode("utf-8"), bcrypt.gensalt(rounds=10))
+
+    doc = {
+        "email": email,
+        "fullName": username,
+        "password": hashed,
+        "profilePic": "",
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    result = users.insert_one(doc)
+    user_id = str(result.inserted_id)
+    client.close()
+    return user_id
+
+
+def _mint_chatify_jwt(user_id: str) -> str:
+    """Mint a JWT identical to Chatify backend's generate_token()."""
+    payload = {
+        "userId": user_id,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(days=7),
+    }
+    return pyjwt.encode(payload, _JWT_SECRET, algorithm="HS256")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -842,7 +906,7 @@ class LuxuryLoginWindow(QWidget):
     1. Login page (passkey auth)
     2. If user has NO TOTP → force TOTP setup (QR + confirm)
        If user HAS TOTP → require TOTP verification
-    3. Welcome page
+    3. Mint JWT → open Chatify in browser → close window
     """
 
     def __init__(self):
@@ -865,15 +929,15 @@ class LuxuryLoginWindow(QWidget):
 
         # Page 1: TOTP Setup (forced on first login)
         self.totp_setup_page = TotpSetupPage()
-        self.totp_setup_page.totp_confirmed.connect(self._show_welcome)
+        self.totp_setup_page.totp_confirmed.connect(self._launch_chatify)
         self.stack.addWidget(self.totp_setup_page)
 
         # Page 2: TOTP Verify (subsequent logins)
         self.totp_verify_page = TotpVerifyPage()
-        self.totp_verify_page.totp_verified.connect(self._show_welcome)
+        self.totp_verify_page.totp_verified.connect(self._launch_chatify)
         self.stack.addWidget(self.totp_verify_page)
 
-        # Page 3: Welcome
+        # Page 3: Welcome / Launching status
         self.welcome_page = WelcomePage()
         self.welcome_page.logout_requested.connect(self._show_login)
         self.stack.addWidget(self.welcome_page)
@@ -893,10 +957,41 @@ class LuxuryLoginWindow(QWidget):
             self.stack.setCurrentIndex(1)
             self.setWindowTitle("Setup 2FA")
 
-    def _show_welcome(self, username: str, summary: dict):
+    def _launch_chatify(self, username: str, summary: dict):
+        """
+        Called after full authentication (passkey + TOTP).
+        Mints a JWT, opens the browser to Chatify's fido-callback, and closes.
+        """
+        self.setWindowTitle("Launching Chatify…")
+
+        # Show launching status on the welcome page
         self.welcome_page.set_user(username, summary)
+        self.welcome_page.welcome_title.setText("Launching Chatify…")
+        self.welcome_page.detail_label.setText("Minting token and opening browser…")
         self.stack.setCurrentIndex(3)
-        self.setWindowTitle(f"Welcome — {username}")
+
+        try:
+            # 1. Find or create user in Chatify's MongoDB
+            user_id = _get_or_create_chatify_user(username)
+
+            # 2. Mint JWT
+            token = _mint_chatify_jwt(user_id)
+
+            # 3. Open browser to the fido-callback endpoint
+            callback_url = f"{_CHATIFY_BACKEND_URL}/api/auth/fido-callback?token={token}"
+            webbrowser.open(callback_url)
+
+            self.welcome_page.welcome_title.setText("✓ Launched!")
+            self.welcome_page.detail_label.setText(
+                f"Authenticated as '{username}'\nChatify is open in your browser."
+            )
+
+            # Close the desktop window after 2 seconds
+            QTimer.singleShot(2000, self.close)
+
+        except Exception as exc:
+            self.welcome_page.welcome_title.setText("Launch Failed")
+            self.welcome_page.detail_label.setText(f"Error: {exc}")
 
     def _show_login(self):
         self.login_page.username_input.clear()
