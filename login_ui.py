@@ -48,6 +48,9 @@ load_dotenv(Path(__file__).parent / ".env")
 _CHATIFY_BACKEND_URL = os.getenv("CHATIFY_BACKEND_URL", "http://localhost:3000")
 _CHATIFY_CLIENT_URL = os.getenv("CHATIFY_CLIENT_URL", "http://localhost:5173")
 
+# Hardcoded password — auth is handled by FIDO2 passkey, not password
+_HARDCODED_PASSWORD = "xK9#mQ2$vL7@nR4!pW6&jT8*"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Chatify Backend API helpers
@@ -409,19 +412,11 @@ class LoginPage(QWidget):
         lay.addWidget(self.email_input)
         lay.addSpacing(14)
 
-        # Password field
-        password_label = QLabel("PASSWORD")
-        password_label.setObjectName("fieldLabel")
-        lay.addWidget(password_label)
-        lay.addSpacing(6)
-
+        # Password field (hidden — auth is via FIDO2 passkey)
         self.password_input = QLineEdit()
         self.password_input.setObjectName("passwordInput")
-        self.password_input.setPlaceholderText("Enter your password")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setMinimumHeight(44)
-        lay.addWidget(self.password_input)
-        lay.addSpacing(14)
+        self.password_input.setVisible(False)
 
         # Full Name field (only used for registration)
         fullname_label = QLabel("FULL NAME  (for signup only)")
@@ -469,18 +464,12 @@ class LoginPage(QWidget):
 
     def _get_email_password(self) -> tuple[str, str] | None:
         email = self.email_input.text().strip()
-        password = self.password_input.text()
         if not email:
             self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
             self.status_label.setText("Please enter your email")
             self.email_input.setFocus()
             return None
-        if not password:
-            self.status_label.setStyleSheet("color: #e74c3c; font-size: 11px;")
-            self.status_label.setText("Please enter your password")
-            self.password_input.setFocus()
-            return None
-        return email, password
+        return email, _HARDCODED_PASSWORD
 
     def _get_username(self) -> str | None:
         username = self.username_input.text().strip()
@@ -495,7 +484,6 @@ class LoginPage(QWidget):
         self.login_btn.setEnabled(not busy)
         self.register_btn.setEnabled(not busy)
         self.email_input.setEnabled(not busy)
-        self.password_input.setEnabled(not busy)
         self.username_input.setEnabled(not busy)
         if message:
             self.status_label.setStyleSheet("color: #ffffff; font-size: 11px;")
@@ -1097,7 +1085,6 @@ class LuxuryLoginWindow(QWidget):
 
     def _show_login(self):
         self.login_page.email_input.clear()
-        self.login_page.password_input.clear()
         self.login_page.username_input.clear()
         self.login_page.status_label.setText("")
         self.stack.setCurrentIndex(0)
