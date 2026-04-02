@@ -1,24 +1,28 @@
 """
 credential_store.py — MongoDB-backed persistent storage for WebAuthn/FIDO2 credentials + TOTP.
 
-Uses the 'auth' collection in the same MongoDB database (chatap) as the Chatify backend.
-Validates usernames against the 'users' collection.
+Target collection: chatify.users
 
-Schema per document in the 'auth' collection:
+Existing Chatify users (created by the web app) are looked up for validation only —
+their documents are never modified.
+
+New passkey-registered users get their own document inserted into chatify.users
+with the following schema:
 {
-  "username": "...",
-  "credentials": [
-    {
-      "user_id": "...",         // base64url-encoded WebAuthn user handle
-      "credential_data": "..."  // base64url-encoded AttestedCredentialData
-    }
-  ],
-  "totp_secret": null           // set to base32 string after TOTP setup
+    "email":           "user@gmail.com",
+    "fullName":        "username",
+    "user_id":         "<base64url WebAuthn user handle>",
+    "credential_id":   "<base64url credential ID>",
+    "credential_data": "<base64url AttestedCredentialData bytes>",
+    "totp_secret":     null,
+    "created_at":      <datetime>,
+    "updated_at":      <datetime>
 }
 """
 
 import os
 import base64
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -29,19 +33,26 @@ load_dotenv(Path(__file__).parent / ".env")
 
 _MONGO_URI = os.getenv("MONGO_URI", "")
 
+# Determine the database name: prefer explicit MONGO_DB_NAME env var,
+# otherwise parse it from the URI path (the segment after the last "/"),
+# falling back to "chatify" as the default.
+def _resolve_db_name() -> str:
+    explicit = os.getenv("MONGO_DB_NAME", "").strip()
+    if explicit:
+        return explicit
+    # Parse from URI: mongodb+srv://.../<dbname>?...
+    path = _MONGO_URI.split("/")[-1].split("?")[0].strip()
+    return path if path else "chatify"
+
+_MONGO_DB_NAME = _resolve_db_name()
+
 # ── Database helpers ──────────────────────────────────────────────────
 
 def _get_db():
-    """Return a (client, db) tuple. Caller should close client when done."""
+    """Return a (client, db) tuple. Caller must close client when done."""
     client = MongoClient(_MONGO_URI)
-    db = client["chatap"]
+    db = client[_MONGO_DB_NAME]
     return client, db
-
-
-def _get_auth_collection():
-    """Return (client, auth_collection)."""
-    client, db = _get_db()
-    return client, db["auth"]
 
 
 def _get_users_collection():
@@ -50,75 +61,75 @@ def _get_users_collection():
     return client, db["users"]
 
 
-# ── Username validation against users table ───────────────────────────
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ── Username validation ───────────────────────────────────────────────
 
 
 def validate_username(username: str) -> bool:
     """
-    Check if a username exists in the Chatify 'users' collection.
-    Matches against the 'fullName' field in the users table.
-    Returns True if the user exists.
+    Check if a username exists in chatify.users.
+    Matches against fullName or email fields.
+    Returns True if found.
     """
     client, users = _get_users_collection()
     try:
-        # Match by fullName (username in the desktop app maps to fullName)
-        user = users.find_one({
+        doc = users.find_one({
             "$or": [
                 {"fullName": username},
+                {"email": username},
                 {"email": f"{username}@gmail.com"},
             ]
         })
-        return user is not None
+        return doc is not None
     finally:
         client.close()
 
 
 def get_user_from_users_table(username: str) -> dict | None:
     """
-    Look up a user from the Chatify 'users' collection by username.
-    Returns the user document or None.
+    Look up a user document from chatify.users by fullName or email.
+    Returns the raw document or None.
     """
     client, users = _get_users_collection()
     try:
-        user = users.find_one({
+        return users.find_one({
             "$or": [
                 {"fullName": username},
+                {"email": username},
                 {"email": f"{username}@gmail.com"},
             ]
         })
-        return user
     finally:
         client.close()
 
 
-# ── Auth document helpers ─────────────────────────────────────────────
+# ── Internal: find the passkey doc for a user ─────────────────────────
+# A passkey doc is one that has credential_data at top-level (new schema)
+# or has a credentials array (old patched schema – handled for backward compat).
 
 
-def _ensure_auth_doc(username: str) -> dict:
-    """
-    Ensure an auth document exists for the username.
-    Creates one if it doesn't exist. Returns the document.
-    """
-    client, auth = _get_auth_collection()
-    try:
-        doc = auth.find_one({"username": username})
-        if not doc:
-            doc = {
-                "username": username,
-                "credentials": [],
-                "totp_secret": None,
-            }
-            auth.insert_one(doc)
-        # Migrate old format if needed
-        if "totp_secret" not in doc:
-            auth.update_one(
-                {"username": username},
-                {"$set": {"totp_secret": None}},
-            )
-            doc["totp_secret"] = None
-        return doc
-    finally:
-        client.close()
+def _find_passkey_doc(username: str, users_col) -> dict | None:
+    """Return the user's passkey document, or None."""
+    return users_col.find_one({
+        "$and": [
+            {
+                "$or": [
+                    {"fullName": username},
+                    {"email": username},
+                    {"email": f"{username}@gmail.com"},
+                ]
+            },
+            {
+                "$or": [
+                    {"credential_data": {"$exists": True}},  # new schema
+                    {"credentials":    {"$exists": True}},   # old schema
+                ]
+            },
+        ]
+    })
 
 
 # ── Passkey Credentials ───────────────────────────────────────────────
@@ -126,76 +137,148 @@ def _ensure_auth_doc(username: str) -> dict:
 
 def save_credential(username: str, credential_data_bytes: bytes, user_id: bytes):
     """
-    Save a registered credential for a user in the 'auth' collection.
-    """
-    client, auth = _get_auth_collection()
-    try:
-        entry = {
-            "user_id": base64.urlsafe_b64encode(user_id).decode("ascii"),
-            "credential_data": base64.urlsafe_b64encode(credential_data_bytes).decode("ascii"),
-        }
+    Persist a newly registered passkey credential.
 
-        # Upsert: create doc if missing, push credential
-        auth.update_one(
-            {"username": username},
-            {
-                "$push": {"credentials": entry},
-                "$setOnInsert": {"totp_secret": None},
-            },
-            upsert=True,
-        )
+    Always inserts a new document into chatify.users with the clean schema.
+    A single user may register multiple passkeys — each gets its own document.
+    """
+    from fido2.webauthn import AttestedCredentialData
+
+    cred = AttestedCredentialData(credential_data_bytes)
+    credential_id_b64 = base64.urlsafe_b64encode(bytes(cred.credential_id)).decode("ascii")
+    user_id_b64 = base64.urlsafe_b64encode(user_id).decode("ascii")
+    cred_data_b64 = base64.urlsafe_b64encode(credential_data_bytes).decode("ascii")
+
+    now = _now()
+    doc = {
+        "email":           f"{username}@gmail.com" if "@" not in username else username,
+        "fullName":        username,
+        "user_id":         user_id_b64,
+        "credential_id":   credential_id_b64,
+        "credential_data": cred_data_b64,
+        "totp_secret":     None,
+        "created_at":      now,
+        "updated_at":      now,
+    }
+
+    client, users = _get_users_collection()
+    try:
+        users.insert_one(doc)
     finally:
         client.close()
 
 
 def get_credentials(username: str) -> list[bytes]:
     """
-    Retrieve stored credential data bytes for a user from MongoDB.
+    Retrieve all credential_data bytes for a user.
 
-    Returns:
-        List of raw AttestedCredentialData bytes, or empty list.
+    Handles both new schema (top-level credential_data) and the legacy
+    credentials-array schema that may exist from earlier migration.
+
+    Returns a list of raw AttestedCredentialData byte strings.
     """
-    client, auth = _get_auth_collection()
+    client, users = _get_users_collection()
     try:
-        doc = auth.find_one({"username": username})
-        if not doc or not doc.get("credentials"):
-            return []
-        result = []
-        for entry in doc["credentials"]:
-            raw = base64.urlsafe_b64decode(entry["credential_data"])
-            result.append(raw)
+        # Collect ALL passkey docs for this user (one per registered key)
+        docs = list(users.find({
+            "$and": [
+                {
+                    "$or": [
+                        {"fullName": username},
+                        {"email": username},
+                        {"email": f"{username}@gmail.com"},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"credential_data": {"$exists": True}},
+                        {"credentials":    {"$exists": True}},
+                    ]
+                },
+            ]
+        }))
+
+        result: list[bytes] = []
+        for doc in docs:
+            # New schema: single top-level credential_data
+            if "credential_data" in doc:
+                result.append(base64.urlsafe_b64decode(doc["credential_data"]))
+            # Legacy schema: embedded credentials array
+            elif "credentials" in doc:
+                for entry in doc.get("credentials", []):
+                    result.append(base64.urlsafe_b64decode(entry["credential_data"]))
+
         return result
     finally:
         client.close()
 
 
 def get_user_id(username: str) -> bytes | None:
-    """Get the stored user_id for a username, or None if not registered."""
-    client, auth = _get_auth_collection()
+    """Return the WebAuthn user_id bytes for a user, or None if unregistered."""
+    client, users = _get_users_collection()
     try:
-        doc = auth.find_one({"username": username})
-        if doc and doc.get("credentials"):
-            return base64.urlsafe_b64decode(doc["credentials"][0]["user_id"])
+        doc = _find_passkey_doc(username, users)
+        if not doc:
+            return None
+        # New schema
+        if "user_id" in doc:
+            return base64.urlsafe_b64decode(doc["user_id"])
+        # Legacy schema
+        creds = doc.get("credentials", [])
+        if creds:
+            return base64.urlsafe_b64decode(creds[0]["user_id"])
         return None
     finally:
         client.close()
 
 
 def get_all_users() -> list[str]:
-    """Return a list of all registered usernames from the auth collection."""
-    client, auth = _get_auth_collection()
+    """Return all usernames that have at least one registered passkey."""
+    client, users = _get_users_collection()
     try:
-        docs = auth.find({}, {"username": 1})
-        return [doc["username"] for doc in docs]
+        docs = users.find({
+            "$or": [
+                {"credential_data": {"$exists": True}},
+                {"credentials":    {"$exists": True, "$ne": []}},
+            ]
+        }, {"fullName": 1})
+        seen: set[str] = set()
+        result: list[str] = []
+        for doc in docs:
+            name = doc.get("fullName", "")
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result
     finally:
         client.close()
 
 
 def delete_credential(username: str) -> bool:
-    """Delete all credentials for a user. Returns True if found and deleted."""
-    client, auth = _get_auth_collection()
+    """
+    Delete all passkey documents for a user.
+    Old Chatify user documents (without credential_data) are left untouched.
+    Returns True if at least one document was deleted.
+    """
+    client, users = _get_users_collection()
     try:
-        result = auth.delete_one({"username": username})
+        result = users.delete_many({
+            "$and": [
+                {
+                    "$or": [
+                        {"fullName": username},
+                        {"email": username},
+                        {"email": f"{username}@gmail.com"},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"credential_data": {"$exists": True}},
+                        {"credentials":    {"$exists": True}},
+                    ]
+                },
+            ]
+        })
         return result.deleted_count > 0
     finally:
         client.close()
@@ -205,23 +288,38 @@ def delete_credential(username: str) -> bool:
 
 
 def save_totp_secret(username: str, secret: str):
-    """Update the totp_secret field for a user."""
-    client, auth = _get_auth_collection()
+    """Set or update the totp_secret on the user's passkey document(s)."""
+    client, users = _get_users_collection()
     try:
-        auth.update_one(
-            {"username": username},
-            {"$set": {"totp_secret": secret}},
-            upsert=True,
+        users.update_many(
+            {
+                "$and": [
+                    {
+                        "$or": [
+                            {"fullName": username},
+                            {"email": username},
+                            {"email": f"{username}@gmail.com"},
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"credential_data": {"$exists": True}},
+                            {"credentials":    {"$exists": True}},
+                        ]
+                    },
+                ]
+            },
+            {"$set": {"totp_secret": secret, "updated_at": _now()}},
         )
     finally:
         client.close()
 
 
 def get_totp_secret(username: str) -> str | None:
-    """Get the TOTP secret for a user, or None if not yet configured."""
-    client, auth = _get_auth_collection()
+    """Get the TOTP secret from the user's passkey document, or None."""
+    client, users = _get_users_collection()
     try:
-        doc = auth.find_one({"username": username})
+        doc = _find_passkey_doc(username, users)
         if not doc:
             return None
         return doc.get("totp_secret")
@@ -230,17 +328,33 @@ def get_totp_secret(username: str) -> str | None:
 
 
 def has_totp(username: str) -> bool:
-    """Check if a user has TOTP configured (secret is not null)."""
+    """Return True if the user has TOTP configured."""
     return get_totp_secret(username) is not None
 
 
 def delete_totp(username: str) -> bool:
-    """Reset TOTP secret back to null for a user."""
-    client, auth = _get_auth_collection()
+    """Reset totp_secret to null on the user's passkey document(s)."""
+    client, users = _get_users_collection()
     try:
-        result = auth.update_one(
-            {"username": username},
-            {"$set": {"totp_secret": None}},
+        result = users.update_many(
+            {
+                "$and": [
+                    {
+                        "$or": [
+                            {"fullName": username},
+                            {"email": username},
+                            {"email": f"{username}@gmail.com"},
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"credential_data": {"$exists": True}},
+                            {"credentials":    {"$exists": True}},
+                        ]
+                    },
+                ]
+            },
+            {"$set": {"totp_secret": None, "updated_at": _now()}},
         )
         return result.matched_count > 0
     finally:

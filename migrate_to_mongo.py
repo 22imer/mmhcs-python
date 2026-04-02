@@ -2,7 +2,7 @@
 migrate_to_mongo.py — One-time migration script.
 
 Reads existing credentials.json and uploads all passkey credentials + TOTP secrets
-into the MongoDB 'auth' collection.
+into the MongoDB 'users' collection in the 'chatify' database.
 
 Run once:
     python migrate_to_mongo.py
@@ -34,8 +34,8 @@ def migrate():
         return
 
     client = MongoClient(MONGO_URI)
-    db = client["chatap"]
-    auth = db["auth"]
+    db = client["chatify"]
+    users = db["users"]
 
     migrated = 0
     skipped = 0
@@ -45,19 +45,31 @@ def migrate():
         if isinstance(data, list):
             data = {"credentials": data, "totp_secret": None}
 
-        existing = auth.find_one({"username": username})
-        if existing:
-            print(f"  ⏭  Skipping '{username}' — already exists in MongoDB")
+        # Find existing user in the users collection
+        existing = users.find_one({
+            "$or": [{"fullName": username}, {"email": f"{username}@gmail.com"}]
+        })
+        if not existing:
+            print(f"  ❌  User '{username}' not found in users collection — skipping")
             skipped += 1
             continue
 
-        doc = {
-            "username": username,
-            "credentials": data.get("credentials", []),
-            "totp_secret": data.get("totp_secret"),
-        }
-        auth.insert_one(doc)
-        print(f"  ✅  Migrated '{username}' ({len(doc['credentials'])} credential(s), TOTP: {'yes' if doc['totp_secret'] else 'no'})")
+        if existing.get("credentials"):
+            print(f"  ⏭  Skipping '{username}' — already has credentials in users collection")
+            skipped += 1
+            continue
+
+        # Add passkey fields to the existing user document
+        users.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "credentials": data.get("credentials", []),
+                "totp_secret": data.get("totp_secret"),
+            }},
+        )
+        cred_count = len(data.get('credentials', []))
+        has_totp = 'yes' if data.get('totp_secret') else 'no'
+        print(f"  ✅  Migrated '{username}' ({cred_count} credential(s), TOTP: {has_totp})")
         migrated += 1
 
     client.close()
