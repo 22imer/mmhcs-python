@@ -1081,8 +1081,8 @@ class LuxuryLoginWindow(QWidget):
                 f"Authenticated as '{username}'\nChatify is open in your browser."
             )
 
-            # Close the desktop window after 2 seconds
-            QTimer.singleShot(2000, self.close)
+            # Close the desktop window after 3 seconds
+            QTimer.singleShot(4000, self.close)
 
         except Exception as exc:
             self.welcome_page.welcome_title.setText("Launch Failed")
